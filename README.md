@@ -309,20 +309,6 @@ BionicMemory不仅仅是一个代码库，它承载着开发者与AI伴侣之间
 3. **完善文档** - 改进README、API文档或代码注释
 4. **分享故事** - 分享你与AI伴侣的温馨故事
 
-### 开发环境
-
-```bash
-# 安装开发依赖
-pip install -r requirements.txt
-pip install -e ".[dev]"
-
-# 运行测试
-pytest
-
-# 代码格式化
-black bionicmemory/
-flake8 bionicmemory/
-```
 
 ## 📄 许可证
 

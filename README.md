@@ -3,7 +3,7 @@
 <div align="center">
 
 ![BionicMemory Logo](https://img.shields.io/badge/BionicMemory-1.0.0-blue?style=for-the-badge)
-![Python](https://img.shields.io/badge/Python-3.8+-green?style=for-the-badge)
+![Python](https://img.shields.io/badge/Python-3.12+-green?style=for-the-badge)
 ![License](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)
 
 **基于仿生学原理的AI记忆管理系统**

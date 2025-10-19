@@ -8,6 +8,9 @@ import sys
 import uvicorn
 import socket
 from pathlib import Path
+# 加载环境变量
+from dotenv import load_dotenv
+load_dotenv()
 
 # 添加项目根目录到Python路径
 project_root = Path(__file__).parent.parent

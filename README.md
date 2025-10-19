@@ -102,7 +102,7 @@ BionicMemory/
 - Python 3.12+
 - 8核CPU ，不需要GPU
 - 16GB+ 内存
-
+- 
 
 ### 安装步骤
 

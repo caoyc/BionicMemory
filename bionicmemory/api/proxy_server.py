@@ -1,3 +1,8 @@
+"""
+基于OpenAI官方库的代理服务器
+使用OpenAI官方客户端处理所有请求，确保完全兼容
+"""
+
 from contextlib import asynccontextmanager
 import os
 import json
@@ -5,17 +10,49 @@ import logging
 import asyncio
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
-import httpx
 from fastapi import FastAPI, Request, Response, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 
+# OpenAI官方库
+from openai import OpenAI, AsyncOpenAI
+from openai.types.chat import ChatCompletion, ChatCompletionChunk
+from openai.types.embedding import Embedding
+
+# BionicMemory核心组件
 from bionicmemory.core.memory_system import LongShortTermMemorySystem, SourceType
 from bionicmemory.services.memory_cleanup_scheduler import MemoryCleanupScheduler
 from bionicmemory.core.chroma_service import ChromaService
 from bionicmemory.algorithms.newton_cooling_helper import CoolingRate
 from bionicmemory.services.local_embedding_service import get_embedding_service
+
+# 使用统一日志配置
+from bionicmemory.utils.logging_config import get_logger
+logger = get_logger(__name__)
+
+# ========== 环境变量配置 ==========
+# 禁用ChromaDB遥测
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
+
+API_HOST = os.getenv("API_HOST", "0.0.0.0")
+API_PORT = int(os.getenv("API_PORT", "8000"))
+CHROMA_HOST = os.getenv("CHROMA_HOST", "localhost")
+CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8001"))
+CHROMA_CLIENT_TYPE = os.getenv("CHROMA_CLIENT_TYPE", "persistent")
+
+# ========== OpenAI配置 ==========
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.deepseek.com")
+OPENAI_MODEL_NAME = os.getenv("OPENAI_MODEL_NAME", "deepseek-chat")
+
+# 记忆系统配置
+SUMMARY_MAX_LENGTH = int(os.getenv('SUMMARY_MAX_LENGTH', '500'))
+MAX_RETRIEVAL_RESULTS = int(os.getenv('MAX_RETRIEVAL_RESULTS', '7'))
+CLUSTER_MULTIPLIER = int(os.getenv('CLUSTER_MULTIPLIER', '3'))
+RETRIEVAL_MULTIPLIER = int(os.getenv('RETRIEVAL_MULTIPLIER', '2'))
+
+# ========== 工具函数 ==========
 
 def extract_user_message(messages: List[Dict]) -> Optional[str]:
     """从消息列表中提取用户消息"""
@@ -53,7 +90,6 @@ def enhance_chat_with_memory(body_data: Dict, user_id: str) -> Tuple[Dict, List[
     Args:
         body_data: 请求体数据
         user_id: 用户ID
-        api_key: API密钥
     
     Returns:
         (增强后的body_data, enhanced_query_embedding)
@@ -116,64 +152,19 @@ async def process_ai_reply_async(response_content: str, user_id: str, current_us
     except Exception as e:
         logger.error(f"❌ 异步处理AI回复失败: {e}")
 
-# 使用统一日志配置
-from bionicmemory.utils.logging_config import get_logger
-logger = get_logger(__name__)
-
-# ========== 环境变量配置 ==========
-# 禁用ChromaDB遥测
-os.environ["ANONYMIZED_TELEMETRY"] = "False"
-
-API_HOST = os.getenv("API_HOST", "0.0.0.0")
-API_PORT = int(os.getenv("API_PORT", "8000"))
-CHROMA_HOST = os.getenv("CHROMA_HOST", "localhost")
-CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8001"))
-CHROMA_CLIENT_TYPE = os.getenv("CHROMA_CLIENT_TYPE", "persistent")
-
-# ========== ChatCompletion 配置 ==========
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.deepseek.com")
-OPENAI_MODEL_NAME = os.getenv("OPENAI_MODEL_NAME", "deepseek-chat")
-
-# ========== Embedding 配置 ==========
-# 移除远程embedding配置，只使用本地embedding
-
-# 记忆系统配置
-# 记忆系统配置
-SUMMARY_MAX_LENGTH = int(os.getenv('SUMMARY_MAX_LENGTH', '500'))
-MAX_RETRIEVAL_RESULTS = int(os.getenv('MAX_RETRIEVAL_RESULTS', '7'))
-CLUSTER_MULTIPLIER = int(os.getenv('CLUSTER_MULTIPLIER', '3'))
-RETRIEVAL_MULTIPLIER = int(os.getenv('RETRIEVAL_MULTIPLIER', '2'))
-# 生命周期事件处理器
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # 启动时初始化
-    initialize_memory_system()
-    yield
-    # 关闭时清理
-    if memory_cleanup_scheduler:
-        memory_cleanup_scheduler.stop()
-        logger.info("记忆清理调度器已停止")
-
-# 初始化FastAPI应用
-app = FastAPI(title="ChromaWithForgetting Memory System", version="1.0.0", lifespan=lifespan)
-
-# 添加CORS中间件
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# 全局变量
+# ========== 全局变量 ==========
 memory_system = None
 memory_cleanup_scheduler = None
 chroma_service = None
 
-# 初始化记忆系统
+# OpenAI客户端
+openai_client = None
+async_openai_client = None
+
+# ========== 初始化函数 ==========
+
 def initialize_memory_system():
+    """初始化记忆系统"""
     global memory_system, memory_cleanup_scheduler, chroma_service
     
     try:
@@ -204,7 +195,6 @@ def initialize_memory_system():
             logger.warning("启动清空短期记忆库失败", exc_info=True)
         
         # 初始化清理调度器
-        # 使用科学算法，不再需要手动配置参数
         memory_cleanup_scheduler = MemoryCleanupScheduler(memory_system=memory_system)
         memory_cleanup_scheduler.start()
         
@@ -214,53 +204,96 @@ def initialize_memory_system():
         logger.error(f"记忆系统初始化失败: {str(e)}", exc_info=True)
         return False
 
-# 健康检查端点
+def initialize_openai_clients():
+    """初始化OpenAI客户端"""
+    global openai_client, async_openai_client
+    
+    try:
+        logger.info("正在初始化OpenAI客户端...")
+        
+        # 同步客户端
+        openai_client = OpenAI(
+            api_key=OPENAI_API_KEY,
+            base_url=OPENAI_API_BASE
+        )
+        
+        # 异步客户端
+        async_openai_client = AsyncOpenAI(
+            api_key=OPENAI_API_KEY,
+            base_url=OPENAI_API_BASE
+        )
+        
+        logger.info("OpenAI客户端初始化完成")
+        return True
+    except Exception as e:
+        logger.error(f"OpenAI客户端初始化失败: {e}")
+        return False
+
+# ========== 生命周期事件处理器 ==========
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 启动时初始化
+    initialize_memory_system()
+    initialize_openai_clients()
+    yield
+    # 关闭时清理
+    if memory_cleanup_scheduler:
+        memory_cleanup_scheduler.stop()
+        logger.info("记忆清理调度器已停止")
+
+# ========== FastAPI应用初始化 ==========
+app = FastAPI(title="BionicMemory OpenAI Proxy", version="2.0.0", lifespan=lifespan)
+
+# 添加CORS中间件
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ========== 健康检查端点 ==========
 @app.get("/health")
 async def health_check():
     return {
         "status": "healthy",
-        "service": "ChromaWithForgetting Memory System",
+        "service": "BionicMemory OpenAI Proxy",
         "timestamp": datetime.now().isoformat(),
         "memory_system_initialized": memory_system is not None,
+        "openai_client_initialized": openai_client is not None,
         "cleanup_scheduler_running": memory_cleanup_scheduler is not None if memory_cleanup_scheduler else False
     }
 
+# ========== 主要路由处理 ==========
 @app.api_route("/v1/{path:path}", methods=["POST", "GET"])
 async def proxy(request: Request, path: str):
     """
     代理所有 /v1/* 请求
-    1. 除对话和embedding外，其他openai api完整透传
-    2. embedding按配置处理（远程/本地）
-    3. 对话：流式实时返回 + 记忆增强（收集用户和AI内容）
+    使用OpenAI官方库处理，确保完全兼容
     """
     body = await request.body()
     
     # 记录基本请求信息
     logger.info(f"📥 收到请求: {request.method} /v1/{path}")
     
-    # 创建新的头部字典
-    new_headers = {}
-    for key, value in request.headers.items():
-        if key.lower() not in ['content-length', 'host', 'authorization']:
-            new_headers[key] = value
-
     # ========== 路由处理 ==========
     if path.startswith("embeddings"):
-        # Embedding API - 按配置处理
-        return await handle_embedding_request(request, path, body, new_headers)
+        # Embedding API - 使用本地embedding服务
+        return await handle_embedding_request(request, path, body)
         
     elif path == "chat/completions":
-        # Chat Completions API - 流式实时 + 记忆增强
-        return await handle_chat_request(request, path, body, new_headers)
+        # Chat Completions API - 使用OpenAI客户端 + 记忆增强
+        return await handle_chat_request(request, path, body)
         
     else:
-        # 其他 API - 完整透传
-        return await handle_other_request(request, path, body, new_headers)
+        # 其他 API - 使用OpenAI客户端透传
+        return await handle_other_request(request, path, body)
 
 # ========== 处理函数 ==========
 
-async def handle_embedding_request(request, path, body, new_headers):
-    """处理embedding请求 - 按配置选择远程/本地"""
+async def handle_embedding_request(request: Request, path: str, body: bytes):
+    """处理embedding请求 - 使用本地embedding服务"""
     try:
         # 解析请求体
         if body:
@@ -269,11 +302,11 @@ async def handle_embedding_request(request, path, body, new_headers):
             model = body_data.get("model", "")
             
             # 使用本地embedding服务
-            logger.info(" 使用本地embedding服务")
+            logger.info("使用本地embedding服务")
             embedding_service = get_embedding_service()
             embeddings = embedding_service.get_embeddings([input_text])
             
-            # 构造响应
+            # 构造OpenAI兼容的响应
             response_data = {
                 "object": "list",
                 "data": [{
@@ -297,14 +330,15 @@ async def handle_embedding_request(request, path, body, new_headers):
             content={"error": f"处理embedding请求失败: {str(e)}"}
         )
 
-async def handle_chat_request(request, path, body, new_headers):
-    """处理对话请求 - 流式实时 + 记忆增强"""
+async def handle_chat_request(request: Request, path: str, body: bytes):
+    """处理对话请求 - 使用OpenAI客户端 + 记忆增强"""
     try:
         # 解析请求体
         body_data = None
         user_id = None
         enhanced_query_embedding = None
         current_user_content = None
+        
         if body:
             body_data = json.loads(body)
             # 提取用户ID
@@ -317,102 +351,90 @@ async def handle_chat_request(request, path, body, new_headers):
             # 记忆增强处理
             enhanced_body_data, query_embedding = enhance_chat_with_memory(body_data, user_id)
             current_user_content = body_data.get("messages", [])[-1].get("content", "")
-            body = json.dumps(enhanced_body_data).encode()
-        
-        # 使用配置的API_KEY
-        api_key = OPENAI_API_KEY
-        
-        # 设置头部
-        target_base = OPENAI_API_BASE.rstrip("/")
-        new_headers["Authorization"] = f"Bearer {api_key}"
-        if body:
-            new_headers["Content-Length"] = str(len(body))
-        
-        url = f"{target_base}/{path}"
+            body_data = enhanced_body_data
         
         # 检查是否为流式响应
         is_stream = body_data and body_data.get("stream", False) if body_data else False
         
         if is_stream:
-            # 流式响应：使用正确的httpx.stream语法
-            logger.info("🌊 处理流式响应")
+            # 流式响应 - 使用异步OpenAI客户端
+            logger.info("🌊 处理流式响应（使用OpenAI客户端）")
             
-            async def stream_wrapper():
-                full_content = ""
-                async with httpx.AsyncClient() as client:
-                    async with client.stream(
-                        method=request.method,
-                        url=url,
-                        headers=new_headers,
-                        content=body,
-                        timeout=60.0
-                    ) as resp:
-                        
-                        async for chunk in resp.aiter_bytes():
-                            # 透传数据
-                            yield chunk
-                            
-                            # 同时收集内容
-                            chunk_str = chunk.decode('utf-8')
-                            lines = chunk_str.split('\n')
-                            
-                            for line in lines:
-                                line = line.strip()
-                                if not line:
-                                    continue
-                                if line.startswith('data: '):
-                                    chunk_data = line[6:].strip()
-                                    if chunk_data == '[DONE]':
-                                        break
-                                    try:
-                                        chunk_json = json.loads(chunk_data)
-                                        if 'choices' in chunk_json and len(chunk_json['choices']) > 0:
-                                            choice = chunk_json['choices'][0]
-                                            delta = choice.get('delta', {})
-                                            if 'content' in delta and delta['content']:
-                                                chunk_content = delta['content'].strip()
-                                                if chunk_content:
-                                                    full_content += chunk_content
-                                    except json.JSONDecodeError:
-                                        continue
-                
-                # 流式结束后异步存储记忆
-                if full_content and body_data:
-                    asyncio.create_task(process_ai_reply_async(full_content, user_id, current_user_content))
-            
-            return StreamingResponse(
-                stream_wrapper(),
-                status_code=200,
-                headers={"Content-Type": "text/plain; charset=utf-8"}
-            )
-        else:
-            # 非流式响应：正常处理
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                resp = await client.request(
-                    method=request.method,
-                    url=url,
-                    headers=new_headers,
-                    content=body
+            try:
+                # 使用OpenAI客户端创建流式响应
+                stream = await async_openai_client.chat.completions.create(
+                    model=body_data.get("model", OPENAI_MODEL_NAME),
+                    messages=body_data.get("messages", []),
+                    stream=True,
+                    **{k: v for k, v in body_data.items() 
+                       if k not in ["model", "messages", "stream"]}
                 )
-            
-            # 异步存储记忆
-            if resp.status_code == 200 and resp.content and body_data:
-                try:
-                    response_data = resp.json()
-                    choices = response_data.get("choices", [])
-                    if choices and len(choices) > 0:
-                        message = choices[0].get("message", {})
-                        content = message.get("content", "")
+                
+                async def openai_stream_wrapper():
+                    full_content = ""
+                    async for chunk in stream:
+                        # 使用OpenAI原生格式
+                        chunk_data = chunk.model_dump()
+                        content = chunk_data.get('choices', [{}])[0].get('delta', {}).get('content', '')
                         if content:
-                            asyncio.create_task(process_ai_reply_async(content, user_id, current_user_content))
-                except Exception as e:
-                    logger.error(f"❌ 处理非流式AI回复失败: {e}")
+                            full_content += content
+                        
+                        # 转换为SSE格式
+                        yield f"data: {json.dumps(chunk_data)}\n\n"
+                    
+                    # 流式结束后异步存储记忆
+                    if full_content and body_data:
+                        asyncio.create_task(process_ai_reply_async(
+                            full_content, user_id, current_user_content
+                        ))
+                    
+                    yield "data: [DONE]\n\n"
+                
+                return StreamingResponse(
+                    openai_stream_wrapper(),
+                    status_code=200,
+                    headers={
+                        "Content-Type": "text/plain; charset=utf-8",
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive"
+                    }
+                )
+                
+            except Exception as e:
+                logger.error(f"❌ OpenAI流式处理失败: {e}")
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": f"流式处理失败: {str(e)}"}
+                )
+        else:
+            # 非流式响应 - 使用同步OpenAI客户端
+            logger.info("📝 处理非流式响应（使用OpenAI客户端）")
             
-            return Response(
-                content=resp.content,
-                status_code=resp.status_code,
-                headers=dict(resp.headers)
-            )
+            try:
+                response = openai_client.chat.completions.create(
+                    model=body_data.get("model", OPENAI_MODEL_NAME),
+                    messages=body_data.get("messages", []),
+                    **{k: v for k, v in body_data.items() 
+                       if k not in ["model", "messages"]}
+                )
+                
+                # 异步存储记忆
+                if response.choices[0].message.content and body_data:
+                    asyncio.create_task(process_ai_reply_async(
+                        response.choices[0].message.content, 
+                        user_id, 
+                        current_user_content
+                    ))
+                
+                # 返回OpenAI原生响应
+                return JSONResponse(content=response.model_dump())
+                
+            except Exception as e:
+                logger.error(f"❌ OpenAI非流式处理失败: {e}")
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": f"非流式处理失败: {str(e)}"}
+                )
             
     except Exception as e:
         logger.error(f"❌ 处理对话请求失败: {e}")
@@ -421,34 +443,54 @@ async def handle_chat_request(request, path, body, new_headers):
             content={"error": f"处理对话请求失败: {str(e)}"}
         )
 
-async def handle_other_request(request, path, body, new_headers):
-    """处理其他API - 完整透传"""
+async def handle_other_request(request: Request, path: str, body: bytes):
+    """处理其他API - 使用OpenAI客户端透传"""
     try:
-        # 使用配置的API_KEY
-        api_key = OPENAI_API_KEY
+        # 解析请求体
+        body_data = json.loads(body) if body else {}
         
-        # 设置头部
-        target_base = OPENAI_API_BASE.rstrip("/")
-        new_headers["Authorization"] = f"Bearer {api_key}"
-        if body:
-            new_headers["Content-Length"] = str(len(body))
+        # 使用OpenAI客户端处理其他请求
+        logger.info(f"🔄 处理其他请求: {path}")
         
-        url = f"{target_base}/{path}"
+        # 根据路径选择处理方法
+        if path == "models":
+            # 模型列表请求
+            models_response = {
+                "object": "list",
+                "data": [
+                    {
+                        "id": OPENAI_MODEL_NAME,
+                        "object": "model",
+                        "created": int(datetime.now().timestamp()),
+                        "owned_by": "bionicmemory"
+                    }
+                ]
+            }
+            return JSONResponse(content=models_response)
         
-        # 直接转发
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.request(
-                method=request.method,
-                url=url,
-                headers=new_headers,
-                content=body
-            )
-        
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            headers=dict(resp.headers)
-        )
+        else:
+            # 其他请求透传
+            try:
+                # 使用OpenAI客户端处理
+                if request.method == "GET":
+                    # GET请求处理
+                    response = openai_client._client.get(f"/v1/{path}")
+                    return JSONResponse(content=response.json())
+                else:
+                    # POST请求处理
+                    response = openai_client._client.post(
+                        f"/v1/{path}",
+                        json=body_data,
+                        headers={"Authorization": f"Bearer {OPENAI_API_KEY}"}
+                    )
+                    return JSONResponse(content=response.json())
+                    
+            except Exception as e:
+                logger.error(f"❌ OpenAI客户端处理其他请求失败: {e}")
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": f"处理请求失败: {str(e)}"}
+                )
         
     except Exception as e:
         logger.error(f"❌ 处理其他请求失败: {e}")
@@ -457,3 +499,13 @@ async def handle_other_request(request, path, body, new_headers):
             content={"error": f"处理其他请求失败: {str(e)}"}
         )
 
+# ========== 启动配置 ==========
+if __name__ == "__main__":
+    uvicorn.run(
+        "bionicmemory.api.proxy_server_openai:app",
+        host=API_HOST,
+        port=API_PORT,
+        log_level="info",
+        access_log=True,
+        reload=False
+    )

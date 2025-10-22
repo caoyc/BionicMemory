@@ -61,8 +61,22 @@ def extract_user_message(messages: List[Dict]) -> Optional[str]:
             return message.get("content", "")
     return None
 
-def extract_user_id_from_request(body_data: Dict) -> str:
-    """从OpenAI请求中提取用户ID"""
+def extract_api_key_from_request(request: Request) -> str:
+    """从请求头中提取API Key"""
+    try:
+        authorization = request.headers.get("Authorization", "")
+        if authorization.startswith("Bearer "):
+            api_key = authorization[7:].strip()  # 去掉"Bearer "前缀并去除空格
+            logger.info(f"🔑 提取到API Key: {api_key[:10]}...")
+            return api_key
+        logger.info("🔑 未找到API Key")
+        return ""
+    except Exception as e:
+        logger.error(f"❌ 提取API Key失败: {e}")
+        return ""
+
+def extract_user_id_from_request(body_data: Dict, api_key: str = None) -> str:
+    """从OpenAI请求中提取用户ID，实现API Key隔离"""
     try:
         logger.info("🔍 开始提取用户ID...")
         
@@ -70,11 +84,22 @@ def extract_user_id_from_request(body_data: Dict) -> str:
         if "user" in body_data:
             raw_user = body_data["user"]
             if isinstance(raw_user, str) and raw_user.strip():
-                user_id = raw_user.strip()
+                user = raw_user.strip()
+                # 如果user不为空，user_id为：{api_key}:{user}
+                if api_key:
+                    user_id = f"{api_key}:{user}"
+                else:
+                    user_id = user
                 logger.info(f"✅ 使用对话协议user字段: {user_id}")
                 return user_id
         
-        # 2. 默认值：default_user
+        # 2. 如果user为空，user_id使用{api_key}
+        if api_key:
+            user_id = api_key
+            logger.info(f"✅ 使用API Key作为用户ID: {user_id}")
+            return user_id
+        
+        # 3. 默认值：default_user
         user_id = "default_user"
         logger.info(f"✅ 使用默认用户ID: {user_id}")
         return user_id
@@ -341,8 +366,9 @@ async def handle_chat_request(request: Request, path: str, body: bytes):
         
         if body:
             body_data = json.loads(body)
-            # 提取用户ID
-            user_id = extract_user_id_from_request(body_data)
+            # 提取API Key和用户ID
+            api_key = extract_api_key_from_request(request)
+            user_id = extract_user_id_from_request(body_data, api_key)
             
             # 替换模型名称
             if "model" in body_data:

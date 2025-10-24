@@ -239,11 +239,6 @@ BionicMemory 完美支持 ChatBox、OpenCat、NextChat 等AI聊天界面：
 4. 选择模型：`deepseek-chat`
 5. 启用流式响应
 
-**其他界面配置：**
-- **OpenCat**: 在设置中添加自定义API
-- **NextChat**: 配置API端点和模型
-- **AnythingLLM**: 设置OpenAI兼容接口
-- **Ollama WebUI**: 配置外部API
 
 **通用配置参数：**
 ```

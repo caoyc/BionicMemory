@@ -112,21 +112,35 @@ git clone https://github.com/caoyc/BionicMemory.git
 cd bionicmemory
 ```
 
-2. **安装依赖**
+2. **创建虚拟环境（推荐使用conda）**
+```bash
+# 使用conda创建虚拟环境
+conda create -n bionicmemory python=3.12
+conda activate bionicmemory
+
+```
+
+3. **安装依赖**
 ```bash
 pip install -r requirements.txt
 ```
 
-3. **配置环境变量**
+4. **配置环境变量**
 ```bash
 # 复制配置文件
+# Windows
+copy .env.example .env
+# Linux/Mac
 cp .env.example .env
 
 # 编辑配置文件
+# Windows
+notepad .env
+# Linux/Mac
 nano .env
 ```
 
-4. **启动服务**
+5. **启动服务**
 ```bash
 # 使用启动脚本
 python scripts/uvicorn_start.py
@@ -135,7 +149,7 @@ python scripts/uvicorn_start.py
 # 下载完成后会显示：模型下载完成！
 ```
 
-5. **验证安装**
+6. **验证安装**
 ```bash
 # 健康检查
 curl http://localhost:8000/health
